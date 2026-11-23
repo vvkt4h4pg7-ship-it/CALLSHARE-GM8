@@ -9,10 +9,12 @@ import Darwin
 ///
 /// Design notes:
 /// - CallKit remains the owner of AVAudioSession activation.
-/// - No VoiceProcessingIO is enabled in this first clean baseline, so the
-///   J7 -> iPhone playback path is not subjected to a new system voice DSP mode.
-/// - Capture is read from inputNode.outputFormat(forBus: 0), converted to
-///   mono Float32 at 48 kHz, processed once, sent to L; R is zero for AEC-bypass experiment.
+/// - After CallKit activates the session, input Voice Processing is enabled while
+///   AVAudioEngine is stopped; microphone uplink AEC is active, system AGC is off.
+/// - The existing GM8 -> iPhone playback jitter buffer, player scheduling, and gain
+///   remain intact and unchanged.
+/// - Microphone capture is read from inputNode.outputFormat(forBus: 0), converted to
+///   mono Float32 at 48 kHz, processed once, then sent on the existing J7WV wire layout.
 /// - UDP protocol framing remains WiFiTransport's responsibility.
 final class WiFiVoiceEngine: NSObject {
     private static let sampleRate: Double = 48_000
@@ -69,9 +71,9 @@ final class WiFiVoiceEngine: NSObject {
 
     // Software mic processing. These are intentionally isolated from playback.
     private let highPassAlpha: Double = 0.9896       // ~80 Hz at 48 kHz
-    private let targetRMS: Double = 0.125            // about -18 dBFS
-    private let maximumGain: Double = 32.0           // +30.1 dB ceiling
-    private let minimumGain: Double = 0.35
+    private let targetRMS: Double = 0.080            // about -21.9 dBFS; lower uplink target
+    private let maximumGain: Double = 3.0             // +9.5 dB ceiling; capped to avoid lifting hiss
+    private let minimumGain: Double = 0.25
     private let nearSilenceRMS: Double = 0.000025    // do not raise digital silence
     private let limiterKnee: Double = 0.72
     private let limiterCeiling: Double = 0.94
@@ -366,19 +368,33 @@ final class WiFiVoiceEngine: NSObject {
         }
 
         do {
+            // CallKit has activated AVAudioSession before AppModel calls start().
+            // Enable Voice Processing while AVAudioEngine is stopped and before
+            // reading the capture format (VPIO may change the microphone format).
+            let input = audioEngine.inputNode
+            if !input.isVoiceProcessingEnabled {
+                try input.setVoiceProcessingEnabled(true)
+            }
+            guard input.isVoiceProcessingEnabled else {
+                throw engineError(3, "Voice Processing could not be enabled; refusing AEC-bypass capture")
+            }
+            input.isVoiceProcessingBypassed = false
+            // Keep system AEC active but avoid a second AGC fighting the app's
+            // conservative software mic leveler.
+            input.isVoiceProcessingAGCEnabled = false
+
             if !playbackConnected {
                 audioEngine.attach(playerNode)
                 audioEngine.connect(playerNode, to: audioEngine.mainMixerNode, format: wireFormat)
                 playbackConnected = true
             }
 
-            // Preserve the existing J7 -> iPhone playback gain. No new output
-            // volume adjustment and no VoiceProcessingIO mode switch here.
+            // Preserve the existing J7 -> iPhone playback gain and GM8 jitter
+            // playout path. The new processing is for microphone uplink only.
             playerNode.volume = 1.0
             audioEngine.mainMixerNode.outputVolume = 1.0
 
-            let input = audioEngine.inputNode
-            // The tap is on the input node's OUTPUT bus: this is the microphone
+            // The tap is on the input node's OUTPUT bus after Voice Processing:
             // stream format to capture, not the node's input-bus format.
             let captureFormat = input.outputFormat(forBus: 0)
             guard captureFormat.sampleRate > 0, captureFormat.channelCount > 0 else {
@@ -424,9 +440,11 @@ final class WiFiVoiceEngine: NSObject {
             let routeOutputs = audioSession.currentRoute.outputs
                 .map { "\($0.portType.rawValue):\($0.portName)" }
                 .joined(separator: ",")
-            report("[WIFI_AUDIO] AEC_BYPASS_TEST OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
+            report("[WIFI_AUDIO] VPIO_AEC_GAIN_R1 OPEN OK capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch format=\(captureFormat.commonFormat.rawValue) -> monoFloat/48000 -> S16LE dual-mono 48k/2ch")
+            report("[WIFI_AUDIO] VPIO enabled=\(input.isVoiceProcessingEnabled) bypass=\(input.isVoiceProcessingBypassed) systemAGC=\(input.isVoiceProcessingAGCEnabled)")
+            NSLog("[CALLSHARE][VPIO_AEC_GAIN_R1] enabled=\(input.isVoiceProcessingEnabled) bypass=\(input.isVoiceProcessingBypassed) systemAGC=\(input.isVoiceProcessingAGCEnabled) capture=\(Int(captureFormat.sampleRate))Hz/\(captureFormat.channelCount)ch")
             report("[WIFI_AUDIO] ACTIVE OUTPUT ROUTE=[\(routeOutputs)]")
-            report("[WIFI_AUDIO] FRESH_R1 MIC TX path active; playback path unchanged; VPIO=off")
+            report("[WIFI_AUDIO] VPIO AEC ON; system AGC OFF; software mic gain capped at 3.0x; GM8 jitter playout unchanged")
             return true
         } catch {
             stateLock.lock()
@@ -438,7 +456,8 @@ final class WiFiVoiceEngine: NSObject {
             playerNode.stop()
             micConverter = nil
             micInputFormat = nil
-            report("[WIFI_AUDIO] AEC_BYPASS_TEST START ERROR: \(error.localizedDescription)")
+            NSLog("[CALLSHARE][VPIO_AEC_GAIN_R1] START ERROR: \(error.localizedDescription)")
+            report("[WIFI_AUDIO] VPIO_AEC_GAIN_R1 START ERROR: \(error.localizedDescription)")
             return false
         }
     }
@@ -469,7 +488,7 @@ final class WiFiVoiceEngine: NSObject {
               converted.frameLength > 0,
               let channelData = converted.floatChannelData else {
             if let converterError {
-                report("[WIFI_AUDIO] FRESH_R1 MIC CONVERT ERROR: \(converterError.localizedDescription)")
+                report("[WIFI_AUDIO] VPIO_AEC_GAIN_R1 MIC CONVERT ERROR: \(converterError.localizedDescription)")
             }
             return
         }
@@ -487,7 +506,7 @@ final class WiFiVoiceEngine: NSObject {
             transport.sendAudioPCM(processed.data, sampleRate: 48_000, channels: 2, frames: UInt16(Self.packetFrames))
 
             if txFrames == 1 || txFrames % 50 == 0 {
-                report(String(format: "[WIFI_AUDIO] AEC_BYPASS_TEST MIC TX #%d gain=%.2fx txAtten=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, transmitAttenuation, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
+                report(String(format: "[WIFI_AUDIO] VPIO_AEC_GAIN_R1 MIC TX #%d gain=%.2fx maxGain=%.2fx txAtten=%.2fx rawRMS=%.1f dBFS hpRMS=%.1f dBFS outRMS=%.1f dBFS outPeak=%.1f dBFS", txFrames, processed.gain, maximumGain, transmitAttenuation, processed.rawRMSDBFS, processed.highPassRMSDBFS, processed.outputRMSDBFS, processed.outputPeakDBFS))
             }
         }
     }
@@ -566,8 +585,8 @@ final class WiFiVoiceEngine: NSObject {
                 let bits = UInt16(bitPattern: quantized)
                 let offset = index * 4
 
-                // Experimental AEC-bypass test: processed mic on L, digital silence on R.
-                // Keep the J7WV wire packet size and little-endian S16 format unchanged.
+                // Preserve the existing J7WV wire contract: mic S16_LE on L,
+                // digital silence on R. Voice Processing has run on the input first.
                 let lo = UInt8(truncatingIfNeeded: bits)
                 let hi = UInt8(truncatingIfNeeded: bits >> 8)
                 bytes[offset] = lo
@@ -822,7 +841,7 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     private func engineError(_ code: Int, _ message: String) -> NSError {
-        NSError(domain: "CALLSHARE.WiFiVoiceEngine.FRESH_R1", code: code,
+        NSError(domain: "CALLSHARE.WiFiVoiceEngine.VPIO_AEC_GAIN_R1", code: code,
                 userInfo: [NSLocalizedDescriptionKey: message])
     }
 
