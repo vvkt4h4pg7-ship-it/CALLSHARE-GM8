@@ -1,36 +1,36 @@
-# CALLSHARE GM8 JITTER R1
+# CALLSHARE FINAL — iOS log cleanup + call-end candidate
 
-Separate iOS test candidate for the GM8 audio-receive path. The existing J7 CALLSHARE app and Android Wi-Fi Core are preserved; this repository is intended to produce a side-by-side iPhone test build.
+This is a **separate untested candidate** built from the uploaded `callshareioslast.zip` source tree and the full Android R1 source. It is not the existing installed stable app or a final production release.
 
-## Scope
+## User-requested scope
+1. Remove iOS Live Log / diagnostic screens and runtime diagnostic output while preserving BLE/Wi-Fi connection state and IP display.
+2. Make iPhone CallKit End issue serialized BLE `VOICE_CLOSE` then `HANGUP`, and have the Android bridge request a real cellular hang-up, reporting call end only after `CALL_STATE_IDLE`.
+3. Preserve the working audio path.
 
-The only runtime audio change in this candidate is in `J7Bridge/WiFiVoiceEngine.swift`: complete 48 kHz / stereo / S16_LE / 960-frame (20 ms) PCM blocks enter a bounded receive jitter buffer. Playback is primed with three blocks (about 60 ms), then released on a 20 ms dispatch timer. The queue holds at most eight blocks (160 ms); overflow drops the oldest block to limit latency. Underflow emits one fade-to-silence block, then waits for the three-block prebuffer and fades the next real block in.
+## iOS project
+The project root is this folder: `J7Bridge.xcodeproj`, `J7Bridge/`, `.github/`, `Scripts/`. Use these files in a **separate copy/branch** of CALLSHARENEW; do not overwrite the current stable commit in place. `PRODUCT_BUNDLE_IDENTIFIER` is set to `com.ugur.callshare.callendlogr1` with a matching unique BLE restoration identifier, so this candidate can be installed side-by-side without overwriting the already-tested `com.ugur.callshare.audiofixr2` app.
 
-The following remain unchanged from the uploaded project: `WiFiTransport.swift` (UDP wire format and fragment reassembly), `AppModel.swift`, `CallKitManager.swift`, `K7Protocol.swift`, BLE protocol logic, microphone capture/processing/uplink, and the rest of the call-control implementation.
+- Removed `DiagnosticLogView` / Live Log page and in-memory logs array.
+- Removed app BLE/CallKit direct diagnostic output and disabled existing `log()` / `report()` message sinks via lazy no-op autoclosures.
+- Main status card keeps Wi-Fi state, BLE state, J7 IPv4, and iPhone IPv4.
+- BLE control writes are serialized using `didWriteValueFor` acknowledgements, so the `VOICE_CLOSE` write is processed before the subsequent `HANGUP` request. This change affects the BLE control plane only, not BLE audio framing.
+- `WiFiTransport.swift` is byte-for-byte identical to the uploaded source.
+- `WiFiVoiceEngine.swift` differs only in the final diagnostics `report()` sink; audio capture, packetization, playback queue, stall recovery, route recovery and PCM protocol logic are untouched.
 
-## GM8-only app identity
+## Android patch
+Read `ANDROID_HANGUP_PATCH/README_TR.md`. The uploads represent multiple Android source variants, so the patch includes a unified diff for the full R1 project and a precise one-line case-4 merge note for the newer MainActivity in `ccallsharegüncel.zip`. Only Android `TelephonyBridge.java` and the HANGUP command branch are changed. `WifiCoreSupervisor.java` and the J7 Core are untouched. No private keystore is included.
 
-- Display name: `CALLSHARE GM8`
-- Bundle ID: `com.ugur.callshare.gm8jitterr1`
-- BLE restoration ID: `com.ugur.callshare.gm8jitterr1.ble-central.r1`
+## Checks performed
+- Swift parser (`swiftc -frontend -parse`) passed for modified Swift files. This is **not** a full Xcode/iOS SDK build.
+- No `NSLog`, `print`, `os_log`, `Logger`, Live Log, Diagnostic Log view or `@Published logs` collection remains under `J7Bridge/*.swift`.
+- `WiFiTransport.swift` is byte-for-byte unchanged; `WiFiVoiceEngine.swift` differs only in `report()` sink.
+- Android changes are source-reviewed and patch-tested against the provided full R1 archive; Android SDK build and physical J7 GSM hang-up test have not been run here.
 
-The unique identifiers allow a test install alongside the existing CALLSHARE app. Do not replace or delete the known-good J7 app during testing.
+## Test plan before calling this FINAL
+1. Build iOS IPA on GitHub Actions and install alongside the existing working app.
+2. Build/sign the Android companion APK with the correct existing signing key; grant `ANSWER_PHONE_CALLS`.
+3. Test iPhone CallKit End during a real GSM call; verify `CALL_STATE_IDLE` and the actual GSM call disconnect.
+4. Verify BLE connected, Wi-Fi connected, both IP values, and automatic IP update.
+5. Run at least 3 consecutive calls, lock-screen answer, and a long idle (10-hour if practical) call wake test to verify audio remains good.
 
-## Build
-
-Open `J7Bridge.xcodeproj` in Xcode, select the `J7Bridge` target, choose your Apple Development Team if signing locally, and verify the GM8 bundle ID above. The GitHub Actions workflow builds an **unsigned** iOS IPA and uploads it as the `CALLSHARE-GM8-JITTER-R1-unsigned` artifact. It does not sign an installable IPA or include a signing certificate/provisioning profile.
-
-## Test status
-
-This is an experimental test candidate, not a verified final release. It has not yet been built with Xcode or tested on a physical iPhone. The 60 ms prebuffer adds latency and may not mask larger stalls; compare it against the known-good J7 app and keep test results separate.
-
-## Source audit
-
-Compared with the uploaded `CALLSAHRE IOS IPA` source tree, the candidate changes exactly these existing files:
-
-1. `J7Bridge/WiFiVoiceEngine.swift` — adds GM8 receive jitter buffering and fixed-cadence playout.
-2. `J7Bridge/BLEManager.swift` — changes only the BLE restoration identifier so the test app has a unique restoration identity.
-3. `J7Bridge/Info.plist` — changes the display name and local-network permission description to identify GM8.
-4. `J7Bridge.xcodeproj/project.pbxproj` — changes Debug and Release bundle IDs to the unique GM8 test ID.
-
-`README_GM8_JITTER_R1_TR.md` records the detailed candidate design. The uploaded working tree also contained a pre-existing, uncommitted `NotificationManager.swift` branding change (`J7Bridge — Missed Call` to `CALLSHARE — Missed Call`); that change was present in the supplied source and was not introduced by the GM8 jitter work.
+Do not modify the known-good J7 Wi-Fi Core or PCM/audio engine as part of this work.

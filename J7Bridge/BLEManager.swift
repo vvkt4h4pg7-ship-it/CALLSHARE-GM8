@@ -50,7 +50,7 @@ final class BLEManager: NSObject, ObservableObject {
             delegate: self,
             queue: .main,
             options: [
-                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.gm8jitterr1.ble-central.r1",
+                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.callendlogr1.ble-central.r1",
                 CBCentralManagerOptionShowPowerAlertKey: true
             ]
         )

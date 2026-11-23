@@ -1,4 +1,4 @@
-name: CALLSHARE GM8 JITTER R1 iOS Build
+﻿name: CALLSHARE Final iOS Build
 
 on:
   workflow_dispatch:
@@ -35,10 +35,10 @@ jobs:
           mkdir -p ipa_staging/Payload
           cp -R build/Release-iphoneos/J7Bridge.app ipa_staging/Payload/
           cd ipa_staging
-          zip -qry ../CALLSHARE-GM8-JITTER-R1-unsigned.ipa Payload
+          zip -qry ../CALLSHARE-Final-unsigned.ipa Payload
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: CALLSHARE-GM8-JITTER-R1-unsigned
-          path: CALLSHARE-GM8-JITTER-R1-unsigned.ipa
+          name: CALLSHARE-Final-unsigned
+          path: CALLSHARE-Final-unsigned.ipa

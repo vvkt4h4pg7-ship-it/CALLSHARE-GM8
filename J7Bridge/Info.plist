@@ -5,7 +5,7 @@
 	<key>CFBundleExecutable</key>
 	<string>J7Bridge</string>
 	<key>CFBundleDisplayName</key>
-	<string>CALLSHARE GM8</string>
+	<string>CALLSHARE</string>
 	<key>CFBundleIdentifier</key>
 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleName</key>
@@ -15,7 +15,7 @@
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>CALLSHARE GM8 uses the local Wi-Fi network to exchange GSM call signaling and audio with the GM8 hotspot.</string>
+	<string>CALLSHARE uses the local Wi-Fi network to exchange GSM call signaling and audio with the J7 hotspot.</string>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>CALLSHARE uses Bluetooth Low Energy to communicate with the IKOS K7 gateway.</string>
 	<key>NSMicrophoneUsageDescription</key>
