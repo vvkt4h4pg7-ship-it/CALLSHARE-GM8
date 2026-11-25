@@ -76,7 +76,21 @@ final class WiFiTransport {
     private var sequence: UInt32 = 0
     private var pendingTX: [Data] = []
     private var pendingControlTX: [Data] = []
-    private let maxPendingTX = 15 // 5 complete R2 audio frames at 3 UDP datagrams per frame
+    private let maxPendingTX = 15 // Legacy fragment queue; kept for reconnect compatibility.
+
+    // iPhone microphone uplink pacer. Capture callbacks only enqueue complete
+    // 20 ms PCM frames; this timer sends at most one frame per 20 ms tick.
+    // All fields are owned by txQueue.
+    private let maxPendingAudioFrames = 8 // 160 ms; drop oldest to keep latency bounded.
+    private var pendingAudioFrames: [Data] = []
+    private var audioTXPacer: DispatchSourceTimer?
+    private var audioTXEnqueuedFrames: UInt64 = 0
+    private var audioTXQueueDrops: UInt64 = 0
+    private var audioTXLastCaptureUptime: TimeInterval?
+    private var audioTXCaptureGapMs: Double = 0
+    private var audioTXMaxCaptureGapMs: Double = 0
+    private var audioTXLastPacerTick: TimeInterval?
+    private var audioTXPacerLateTicks: UInt64 = 0
 
     // R1 background resilience: recover terminal UDP uplink failures instead of
     // leaving the audio/control path nil until the user edits the J7 address.
@@ -107,6 +121,7 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self, !self.started else { return }
             self.started = true
+            self.startAudioTXPacerIfNeeded()
             self.startListener()
             self.startUplink()
             self.startControlUplink()
@@ -141,6 +156,13 @@ final class WiFiTransport {
         txQueue.async { [weak self] in
             guard let self else { return }
             self.started = false
+            if let timer = self.audioTXPacer {
+                timer.setEventHandler {}
+                timer.cancel()
+                self.audioTXPacer = nil
+            }
+            self.pendingAudioFrames.removeAll(keepingCapacity: false)
+            self.audioTXLastPacerTick = nil
             self.uplinkReconnectWorkItem?.cancel()
             self.uplinkReconnectWorkItem = nil
             self.controlReconnectWorkItem?.cancel()
@@ -166,6 +188,12 @@ final class WiFiTransport {
             self.rxFragmentParts.removeAll(keepingCapacity: false)
             self.rxFragmentOrder.removeAll(keepingCapacity: false)
             self.txAudioFrames = 0
+            self.audioTXEnqueuedFrames = 0
+            self.audioTXQueueDrops = 0
+            self.audioTXLastCaptureUptime = nil
+            self.audioTXCaptureGapMs = 0
+            self.audioTXMaxCaptureGapMs = 0
+            self.audioTXPacerLateTicks = 0
             self.pendingTX.removeAll(keepingCapacity: false)
             self.pendingControlTX.removeAll(keepingCapacity: false)
         }
@@ -236,27 +264,89 @@ final class WiFiTransport {
             return
         }
 
+        // Record the time the completed frame leaves the AVAudioEngine callback.
+        // The measurement is captured before hopping to txQueue, so it does not
+        // include time spent waiting for the transport queue to execute the block.
+        let captureUptime = ProcessInfo.processInfo.systemUptime
+
+        // Do not send from the AVAudioEngine tap callback. Queue the complete
+        // 20 ms frame and let the transport's fixed-rate pacer perform UDP TX.
         txQueue.async { [weak self] in
             guard let self else { return }
-            let frameSequence = self.nextSequence() // one sequence for all 3 fragments of this frame
-            for fragmentIndex in 0..<Self.fragmentCount {
-                let start = fragmentIndex * Self.fragmentPCMBytes
-                let chunk = pcm.subdata(in: start..<(start + Self.fragmentPCMBytes))
-                let flags = UInt16(0x0001 | Int(Self.fragmentFlag) | (fragmentIndex << Int(Self.fragmentIndexShift)))
-                let packet = self.makeAudioPacket(
-                    pcm: chunk,
-                    sampleRate: sampleRate,
-                    channels: channels,
-                    frames: Self.fragmentFrames,
-                    sequence: frameSequence,
-                    flags: flags
-                )
-                self.enqueueOrSend(packet)
+            if let previous = self.audioTXLastCaptureUptime {
+                self.audioTXCaptureGapMs = (captureUptime - previous) * 1_000.0
+                self.audioTXMaxCaptureGapMs = max(self.audioTXMaxCaptureGapMs, self.audioTXCaptureGapMs)
             }
-            self.txAudioFrames &+= 1
-            if self.txAudioFrames == 1 || self.txAudioFrames % 50 == 0 {
-                self.onStatus?("[WIFI_R2] TX PCM FRAME #\(self.txAudioFrames) seq=\(frameSequence) fragments=3 datagram=1300B totalPCM=3840B")
+            self.audioTXLastCaptureUptime = captureUptime
+            self.audioTXEnqueuedFrames &+= 1
+            if self.pendingAudioFrames.count >= self.maxPendingAudioFrames {
+                self.pendingAudioFrames.removeFirst()
+                self.audioTXQueueDrops &+= 1
             }
+            self.pendingAudioFrames.append(pcm)
+
+            if self.audioTXEnqueuedFrames == 1 || self.audioTXEnqueuedFrames % 100 == 0 {
+                self.onStatus?(String(format: "[WIFI_R2] TX PACER ENQUEUE #%llu queued=%d/%d drops=%llu capture_gap_ms=%.1f capture_gap_max_ms=%.1f",
+                                      self.audioTXEnqueuedFrames, self.pendingAudioFrames.count,
+                                      self.maxPendingAudioFrames, self.audioTXQueueDrops,
+                                      self.audioTXCaptureGapMs, self.audioTXMaxCaptureGapMs))
+            }
+        }
+    }
+
+    private func startAudioTXPacerIfNeeded() {
+        guard audioTXPacer == nil else { return }
+        let timer = DispatchSource.makeTimerSource(queue: txQueue)
+        timer.schedule(deadline: .now() + .milliseconds(20),
+                       repeating: .milliseconds(20),
+                       leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self] in
+            self?.sendNextAudioFrameOnPacerTick()
+        }
+        audioTXPacer = timer
+        timer.resume()
+        onStatus?("[WIFI_R2] TX PACER START interval=20ms queueMax=\(maxPendingAudioFrames) frames")
+    }
+
+    private func sendNextAudioFrameOnPacerTick() {
+        guard started else { return }
+
+        let now = ProcessInfo.processInfo.systemUptime
+        var tickIntervalMs = 0.0
+        if let previous = audioTXLastPacerTick {
+            tickIntervalMs = (now - previous) * 1_000.0
+            if tickIntervalMs > 30.0 {
+                audioTXPacerLateTicks &+= 1
+            }
+        }
+        audioTXLastPacerTick = now
+
+        // Hold frames while the UDP connection is reconnecting. The bounded
+        // queue then keeps the newest 160 ms of microphone audio.
+        guard uplink != nil, !pendingAudioFrames.isEmpty else { return }
+
+        let pcm = pendingAudioFrames.removeFirst()
+        let frameSequence = nextSequence() // one sequence for all 3 fragments of this frame
+        for fragmentIndex in 0..<Self.fragmentCount {
+            let start = fragmentIndex * Self.fragmentPCMBytes
+            let chunk = pcm.subdata(in: start..<(start + Self.fragmentPCMBytes))
+            let flags = UInt16(0x0001 | Int(Self.fragmentFlag) | (fragmentIndex << Int(Self.fragmentIndexShift)))
+            let packet = makeAudioPacket(
+                pcm: chunk,
+                sampleRate: 48_000,
+                channels: 2,
+                frames: Self.fragmentFrames,
+                sequence: frameSequence,
+                flags: flags
+            )
+            enqueueOrSend(packet)
+        }
+
+        txAudioFrames &+= 1
+        if txAudioFrames == 1 || txAudioFrames % 50 == 0 {
+            onStatus?(String(format: "[WIFI_R2] TX PACER SENT #%llu seq=%u queued=%d drops=%llu tick_ms=%.1f late_ticks=%llu fragments=3",
+                             txAudioFrames, frameSequence, pendingAudioFrames.count,
+                             audioTXQueueDrops, tickIntervalMs, audioTXPacerLateTicks))
         }
     }
 
